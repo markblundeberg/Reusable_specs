@@ -169,77 +169,124 @@ Any common-secret-derived keypairs detected from incoming payments are additiona
 
 The multisig m-of-n parties do not keep transaction scanning privacy from each other, and must agree on a common scanning keypair. They can subsequently submit one ECDSA/Schnorr spending pubkey each, and set up the paycode using the n+1 public keys. The expiry date should be set to 0 to remain disabled.
 
-## Generating a transaction to payment code (P2PKH)
+## Receipt of transactions sending to a reusable address
 
-Sender's wallet shall first check the expiry time embedded in the paycode is at least one week ahead of local clock (skip if expiry time is 0). If expiry time is more than a week ahead, proceed.
+Receiving wallets must follow a specific process, detailed here, to detect payment code transactions that are directed at them. Following this process, or an equivalent, ensures that any valid payment code transaction can be identified by a conforming receiver, and thus no funds will be missed. The process of generating such transactions is described in a later section.
 
-Sender's wallet shall determine the outpoints she wants to spend from, and determine which input's public key  is to be used for deriving common secret. For a multi-input transaction whether from single or multiple senders, that designated input should be randomly determined, but limited to within the first 30 inputs. Note that multiple recipients can be included in a single transaction, and each recipient address are free to either be derived from public keys in different designated inputs or the same input.
+In short, this process consists of two scanning steps:
 
-In the case the designated input is P2PKH, P below is simply its embedded public key. In the case of designating P2SH-multisig, it is the first public key with a valid signature within that input.
+1. Prefix filtering: all transactions have their inputs scanned for a short tag prefix that publically classifies the payment code.
 
-A common secret c can be derived as follows:
+2. For every input that matched in the previous step, a shared secret derivation process is performed using the input's spending key, and the reusable address scan key. The output list of the enclosing transaction is then scanned for one or more output addresses derived from the shared secret and the reusable address spend key.
 
-Q = scan_pubkey
+As detailed in the later sections, these two steps are designed so they can be performed by different parties.
 
-d = scan_privkey
+### Prefix filtering
 
-R = spend_pubkey
+The prefix-filtering step requires the full blockchain and knowledge of the payment code. It produces a list of matching transaction inputs.
 
-f = spend_privkey
+1. All transactions in the blockchain and mempool must be scanned, except:
+    - coinbase transactions
+    - old transactions from blocks that are known to predate the creation of the payment code system (or the target payment code itself).
 
-Q = dG
+2. For every transaction, the first 30 inputs are examined. Inputs after the first 30 are ignored.
 
-R = fG
+3. For every input, an input-hash is calculated by serializing the input record as in a raw transaction (Outpoint, len_scriptsig, scriptsig, nSequence), and computing a *double*-SHA256 of this serialized result. The filter matches if the leftmost `prefix_size` bits of the input-hash match the target prefix bitstring.
 
-P = eG = first public key embedded in designated input with a valid signature
+4. The target prefix bitstring is derived from the payment code as follows: take from the leftmost `prefix_size` bits, skipping the first 8 bits, in the compressed-serialized scan public key (the first byte is skipped due to having low entropy). In other words, it is the highest `prefix_size` bits of the scan public key's X coordinate when expressed as a fixed-width 256-bit integer.
 
-e = private key paired with public key P
+Steps 1-3 are intended to be optimized by building an index of the blockchain, ahead of time. When given a target payment code, the index can be efficiently consulted to yield the list of matches.
 
-s = integer derived from outpoint spent by designated input
+### Address derivation process
 
-The common secret c = H(H(e · Q) + s) = H(H(d · P) + s). Here, (·) is the multiplication of points over the secp256k1 elliptic curve, and (+ s) is normal arithmetic as part of this derivation function where H() is SHA-256.
+The address derivation process requires a candidate transaction input (an input with a matching prefix, as in the prefix filtering step) as well as the enclosing transaction, the scan *private key*, and the spend public key(s). It produces a list of matching addresses and the key offset(s) for each one.
 
-Pay to addresses derived from public keys R'<sub>i</sub> = CKDpub(R,c,i), where CKDpub(K,C,i) is the public parent key -> public child key [derivation](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#Public_parent_key_rarr_public_child_key) from BIP32, with the i<sup>th</sup> public key being the i<sup>th</sup> K, starting from i = 0. Addresses should always be generated from compressed pubkeys.
+Every candidate input generates a sequence of output addresses which may or may not appear in the transaction. The derivation process depends on the input type (p2pkh or multisignature) and the payment code type (p2pkh or multisignature). Steps:
 
-To recap, we use the first pubkey with a valid signature of the transaction's designated input, together with the scan key, to derive a shared secret via Elliptic-curve Diffie–Hellman [(reference)](https://en.bitcoin.it/wiki/ECDH_address). This shared secret is combined with the outpoint to obtain a unique scalar value for this payment that is used to tweak the spend key into unique ephemeral keys that is then used to derive addresses.
+1. A sender public key `P` is extracted from the input.
+    - In the case of P2PKH inputs, `P` is simply the spending public key.
+    - In the case of P2SH-multisig inputs, `P` is the public key of the first valid signature.
+        - For legacy multisignatures (null dummy element), the receiver MUST verify signatures against the public keys in the same order as used in the script execution engine, starting from deepest-in-stack, i.e., first-pushed. Then, `P` is the public key used in the first ('leftmost') successful signature verification. Note: Implementations MUST be able to correctly validate signatures with any valid SIGHASH flags, in order to properly determine `P`. Pre-BCH legacy signatures can be ignored, as they predate this specification.
+        - For the newer BCH multisignature style (non-null dummy element), it is not necessary to verify signatures and `P` is the first-pushed pubkey indexed by the least-significant set bit in the dummy (checkbits) element. The push opcode that pushes the checkbits element MUST be correctly parsed in all cases, whether it uses OP_1-OP_16 opcodes or the OP_PUSHDATA*n* opcodes. Note: Even though non-null dummy had legacy mechanics prior to 2019, implementations need not take care of this distinction since it predates this specification's existence.
+        - Invalid public keys in the multisignatures are consensus-valid in some cases. Receivers are not expected to recognize such weird multisignatures.
+    - Other input types (P2SH non-multisig, P2PK, etc.) shall be skipped.
+    - To be clear, what we count as 'P2PKH' or 'P2SH-multisig' must have a specific form of scriptPubKey *and* the scriptSig for that input (both locking and unlocking scripts). This is more strict than most definitions of these types of inputs:
+        - As usual, a P2PKH scriptPubKey is exactly 25 bytes long of the form (in hex) `76a914<20 byte keyhash>88ac` (no non-minimal pushes). A P2SH scriptPubKey is 23 bytes long of the form `7614<20 bytes scripthash>87`.
+        - A P2PKH scriptSig has exactly two minimal pushes, with the form `<sig> <pubkey>`, where `sig` is a validly formatted schnorr or ECDSA (DER) signature with any value of the hashtype byte, and `pubkey` is either a compressed or an uncompressed key.
+        - An M-of-N P2SH-multisig scriptSig has exactly M+2 pushes of the form `<dummy> <sig1> <sig2> ... <sigM> <redeemscript>`, where `redeemscript` is a serialized script that itself parses to `OP_M <pub1> <pub2> ... <pubM> OP_N OP_CHECKMULTISIG`, both scripts with minimal pushes. Each `sig` is a validly formatted schnorr or ECDSA (DER) signature with any value of the hashtype byte, and each `pub` is either a compressed or uncompressed key. The value of `dummy` may be anything (and it may be any kind of push including OP_1 through OP_16).
+            - Current network rules about the interpretation of the multisig dummy value and the uniformity of signature type (schnorr / ecdsa) must not be assumed, as these may change in future.
+        - Note that both uncompressed and compressed keys must be allowed.
+        - Receivers are not required to detect P2PKH or P2SH-multisig inputs that do not exactly fit these descriptions. However, receivers may find it convenient to use more flexible definitions than stated here. For example, it is a burden to fetch the ancestor transaction (to view scriptPubKey) in every case. Thus, it is permissible for receivers to solely examine the scriptSig of the candidate input. (At worst, more liberal rules result slightly more CPU work than is strictly needed).
+2. The elliptic curve point `Q = d · P` is calculated, where `d` is the scan private key (this is a Diffie-Hellman derivation). This point is then serialized as a compressed point and then hashed with SHA256, to yield a 32-byte shared secret value `s`. I.e.: `s = SHA256(ser_comp(Q))`.
+3. The input's spent outpoint is serialized to a length-40 bytestring `outpoint` in the same way as it is serialized in the raw transaction (the txid is "reversed" compared to display order, and the index is little-endian).
+4. A further 32-byte commmon secret value `c` is calculated as `c = SHA256(s || outpoint)`, where `||` denotes concatenation.
+5. The address sequence is derived using `c` and the spending public key(s), and an index `i`.
+    - For a p2pkh payment code, the address sequence at index `i` is calculated via [BIP32 unhardened derivation](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#Public_parent_key_rarr_public_child_key), i.e. `R_i = CKDpub(R,c,i)`. This provides a pseudorandom sequence of additive offsets to `R`, based on `c`. The resultant public key is serialized compressed then hashed to a P2PKH address.
+    - For a multisignature paycode, first each spending public key is passed into the same unhardened derivation: R1'<sub>i</sub> = CKDpub(R1,c,i), R2'<sub>i</sub> = CKDpub(R2,c,i) and R3'<sub>i</sub> = CKDpub(R3,c,i), etc.. The resulting keys are serialized as compressed, then the serialized keys are sorted lexically (as per BIP67 / `sortedmulti` descriptors). The standard P2SH multisignature script is then assembled from the sorted list as `OP_M <sortedkey1> <sortedkey2> ... <sortedkeyN> OP_N OP_CHECKMULTISIG`, and hashed to a P2SH address.
+6. The output list is scanned for outputs to the address derived using `i=0`. If a match is found, or if the BIP32 derivation fails for this index (CKDpub fails with a 2^-127 probability), then the output list is scanned again for outputs to the address derived using `i=1`. This process continues with `i=2`, `i=3`, etc. until an index is found where BIP32 derivation succeeded but no match is found.
+    - Note: Receivers MUST recognize multiple outputs to the same address, so long as they are in the same enclosing transaction.
+    - Note: Receivers MUST recognize multiple inputs paying to the same payment code.
+    - Note: Receivers are not required to detect other outputs to these same addresses that exist in other transactions.
 
-Grinding the prefix is accomplished by using different nonces to sign the designated input until the first prefix_size bits of the double-sha256 of the designated input are shared with the scan_pubkey (skip if prefix_size = 0). "Input" is a combination of the outpoint and scriptsig. The payment transaction is then constructed and ready to be relayed.
+This process produces a list of the addresses identified in step 5, and the key offset(s) for each. The key offset(s) can then be combined with the reusable address spending private key(s) to determine the actual private keys associated with the address in question.
 
-Since bitcoin transactions do not have explicit nonces (unlike blockheaders), the nonce in this case is the random integer "k" value used in creating the transaction signature.  Wallets that already use random "k" can simply keep re-selecting random values as the grinding process.
+## Generating a transaction to payment code
 
-Repeatedly invoking random number generators in a hot wallet may not be desirable for many; for wallets that have implemented RFC6979 for deterministic signatures, the target paycode and nonce can be concatenated to the message (normally the transaction components) that is passed into the function via `ndata`, thus grinding for k for desired signatures while retaining determinism - the same message, private key and desired paycode will always produce the same signature.
+Sending money to a payment code means creating a transaction that will be recognized by the above process. Conforming wallets must not create transactions that cannot be discovered by the above process, since it means a loss of funds.
 
-For this purpose, we recommend that `ndata` be SHA256 hash of (version||paycode||nonce), where `version` is a 1 byte field and defaults to 1, `paycode` is the entirety of the target payment code including checksum, and `nonce` is a 32-byte field incremented starting at 0 for the grind.
+Note: only P2PKH wallets or P2SH-multisignature wallets may send to payment codes.
 
-## Generating a transaction to payment code (P2SH-Multisig)
+The recommended basic process is as follows:
 
-In the case of paying from P2PKH, P below is also the public key of the designated input. In the case of paying from P2SH-multisig, it is the first public key with a valid signature.
+1. Sender's wallet shall first check that the expiry time embedded in the paycode is at least one week ahead of local clock (skip if expiry time is 0). If expiry time is more than a week ahead, proceed.
+2. An unsigned transaction template is created in the regular manner, but using a placeholder output address for the recipient.
+3. Once input coins have been selected, a random input within the first 30 inputs is chosen.
+4. The selected input is then analyzed and an address sequence derived.
+    - The derivation proceeds almost the same as describe above with receiving, except now `Q = D · p` where `D` is the scan *public* key, and `p` is the *private key* corresponding to the input's `P`.
+5. The placeholder output address is then overwritten with the `i=0` derived address.
+    - (optional) Output addresses are re-sorted according to BIP69.
+6. The transaction is then fully signed. The chosen special input is then re-signed repeatedly to produce different prefixes, until it has the correct prefix ("prefix grinding"). See below for recommendations on this process.
 
-The different part is all of the spending public keys will have to be involved in constructing a new P2SH address, described below in paying to a two-of-three P2SH-multisig setup:
+For multisignature wallets, additional care must be taken to avoid funds loss (where the recipient is unable to detect the payment):
 
-Common secret c can be derived as follows:
+- The intended signing set must be identified ahead of time, so that the intended first-used key `P` can be decided.
+- The first-used signer should provide a "proof of equality of discrete logarithms" to the other signers, in order to demonstrate that the Diffie-Hellman secret is correct and that they can be confident that the output goes to the intended recipient.
+- Signers must ensure that the last signer properly executes signature grinding to obtain the correct tag.
+- Signers must not re-sign and malleate the tag.
+- Uninvolved cosigners must not introduce a signature of their own, which would not only malleate the tag but also potentially change which key is the first-used key.
+- Given the above difficulties, cosigners should keep a receipt of the `c` value. In case it turns out that the intended recipient did not see the funds, this information can be sent directly to them and then used to recover funds.
 
-Q = scan_pubkey
+In addition:
 
-d = scan_privkey
+- The first-used signer must not use a key which they use to receive encrypted messages (or is related to such a decrypting key), or else they could be tricked by their cosigners into decrypting a message by having a malicious scan public key in a payment code.
 
-R1, R2, R3 = spend_pubkey
+For cold wallets, some of the concerns from multisignature wallets also apply.
 
-f1, f2, f3 = spend_privkey
+### Note on prefix grinding
 
-Q = dG
+Grinding the prefix is accomplished by modifying the transaction input data until the prefix or its hash matches the desired value. The best way to accomplish this is to simply re-sign the input using a different cryptographic nonce "k" value. For observers, the fact that a nonce has been varied like this is essentially undetectable.
 
-R1 = f1G, ...
+Since bitcoin transactions do not have explicit nonces (unlike blockheaders), the nonce in this case is the random-looking integer "k" value used in creating the transaction signature.  Wallets that already use random "k" can simply keep re-selecting random values as the grinding process.
 
-P = eG = first public key embedded in designated input with a valid signature
+There are serious security concerns about actually using random nonces (an imperfect random source can easily lead to a leakage of the private key), so most wallets will in fact be using RFC6979 for deterministic signatures. In such wallets, simply re-signing the input will change nothing. However, the RFC6979 process allows for additional data to be attached, and by rotating this additional data (for example, setting it to an integer 0 and incrementing on every attempt), a securely pseudorandom stream of distinct nonces is produced.
 
-s = integer derived from outpoint spent by first input
+### Cautions
 
-Common secret c = H(H(eQ) + s) = H(H(dP) + s)
+To reiterate, it is important to not generate transactions that will be unrecognized by a receiving wallet. To emphasize some important 'gotchas':
 
-Pay to new P2SH addresses constructed from keys R1'<sub>i</sub> = CKDpub(R1,c,i), R2'<sub>i</sub> = CKDpub(R2,c,i) and R3'<sub>i</sub> = CKDpub(R3,c,i), with m of n specified in OP_CHECKMULTISIG script. Addresses should always be generated from compressed pubkeys.
-
-Like the case of sending to P2PKH, the sender uses different nonces to sign the designated input until the first prefix_size bits of the double-sha256 of the designated input are shared with the scan_pubkey (skip if prefix_size = 0). The payment transaction is then constructed and ready to be relayed.
+- The correct input (the same used to derive the addresses) must be used for grinding the prefix. It must be within the first 30 inputs.
+    - Even when there is no grinding (prefix length is 0), the input used for derivation must still be within the first 30 inputs.
+- As mentioned above, when sending normally from multisignature wallets, it is simply impossible to securely ensure that funds will reach the intended recipient. Mistakes with multisignatures could easily happen on accident in a typical multisignature coordination, and multisig wallets should caution users about this risk.
+- Sending wallets must make sure that the scriptSigs properly fit the heuristic template process described. Notably:
+    - M-of-N multisignature wallets with N > 16 cannot be used to send to a reusable address, since these do not use OP_*n* in the P2SH redeemscript.
+    - Multisigs with invalid pubkeys are sometimes valid in consensus rules, but they will be excluded by the template.
+- Senders must not skip indices in the derived addresses list. For example, receivers will not check `i=1` if there was nothing on `i=0`.
+- Future upgrades may potentially break certain assumptions behind this specification. Wallets must keep up-to-date and remove any accidentally introduced abilities to create payments that will fail to be detected by existing receiving wallet implementations. This specification may need updates to clarify or extend in light of new rules.
+    - Any new transaction formats must not be used for payment code transactions.
+    - A hypothetical taproot upgrade might permit P2PKH spending with more than two pushes; such P2PKH spends would be ignored by the scriptSig templates.
+    - A new crypto system with a new key type (non-secp256k1, i.e., neither compressed nor uncompressed) would fail detection by the described templates.
+    - A new signature type will also not match the templates.
+    - New malleability vectors may be introduced.
 
 ## Relaying: Infrastructure needed
 
@@ -257,11 +304,9 @@ After a transaction is generated, if the sending wallet detects the version allo
 
 ## Receiving: Onchain direct
 
-If onchain direct sending is used, receiving is relatively straightforward. The recipient shall connect to a Recovery Server and attempt to download all transactions where at least one of the inputs has double-sha256 that match his payment code's prefix, derived from prefix_length bits of his scanpubkey excluding the first low-entropy byte, since he was last online. This will cost bandwidth that is approximately 1/256 of downloading the full blockchain (in the case prefix length = 8 bits; recovery servers may choose to deny excessively short prefix lengths), and less if longer prefix length is specified.
+If onchain direct sending is used, receiving is relatively straightforward. The recipient shall connect to a Recovery Server and attempt to download all transactions with inputs that match his payment code's prefix. This will cost bandwidth that is approximately 1/256 of downloading the full blockchain (in the case prefix length = 8 bits; recovery servers may choose to deny excessively short prefix lengths), and less if longer prefix length is specified.
 
-Upon receiving subscribed transactions, the wallet can then attempt, for each input where double-sha256 prefix matches its paycode and is one of the qualifying type (P2PKH or P2SH-multisig), to derive common secret c from scan_privkey, outpoint spent by that input and the first public key embedded in each input with a matching double-sha256 prefix. If no output addresses match the address generated from R'<sub>0</sub> = CKDpub(R,cG,0), move on to the next matching input within limit of the first 30 inputs; if no inputs are left in the transaction, discard the transaction. If an addresses R'<sub>0</sub> is found, another address R'<sub>1</sub> is derived from that input and attempted to match available outputs, until no more addresses can be found for a given i. This step can also be performed by specialized, trusted servers entrusted with scan privkeys.
-
-Upon obtaining transactions filtered by the scan_privkey, the receiving wallet then stores it locally and assign a spending keypairs R'<sub>i</sub> and h<sub>i</sub> = [CKDpriv](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#Private_parent_key_rarr_private_child_key)(f,c,i) to it. Funds are now available to be spent.
+Upon receiving subscribed transactions, the wallet can then derive addresses out of each input that matches the prefix. If matches are found, the wallet can then store the key offset and address. As soon as the spending private key is also available (which may be immediately), then the final derived private key can be derived as well.
 
 ## Sending: Offchain communications
 
@@ -278,10 +323,6 @@ Clients can log onto retention servers and retrieve their incoming txids. Depend
 After a client fetches a txid from the retention server, he should proceed to request the full transaction from a node, and extract spending keypair as described above. Then the transaction and spending keypair for its output should be stored locally.
 
 Depending on the specific setup, if a client suspects either server downtime, malicious denial of service, or expired retention, it shall connect to a Recovery Server and attempt to recover funds as described in Onchain Direct transactions.
-
-**Receiving to P2SH-Multisig**
-
-The scanning and filtering part shall work exactly like in P2PKH. Once the multisig parties have a filtered transaction ascertained by the scan_privkey, the receiving parties can then each assign public keys R1'<sub>i</sub>, R2'<sub>i</sub>... and private keys CKDpriv(f1,c,i), CKDpriv(f2,c,i)...to the i<sup>th</sup> outputs within the limit of 30. With these keysets, the address can be spent from normally.
 
 ## Expiration time
 
