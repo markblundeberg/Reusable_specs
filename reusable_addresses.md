@@ -2,7 +2,7 @@
 
 BIP-???
 
-v0.4.3, further limit number of inputs
+v0.5.0, changes and clarification on derivation process
 
 @im_uname, with material from Mark Lundeberg, plus discussion with Chris Pacia, Amaury Séchet, Shammah Chancellor, Jonathan Silverblood and Josh Ellithorpe. Additional editing from Freetrader, Emergent_reasons and Jonald Fyookball.
 
